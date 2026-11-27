@@ -360,6 +360,9 @@ class Aria2JobSupervisor:
         self._known_paths: set[Path] = set()
 
     async def enqueue_command(self, cmd: JobCommand) -> None:
+        if cmd.action == "cancel":
+            self._cancelled = True
+            self._delete_on_cancel = cmd.delete_files
         await self._cmd_queue.put(cmd)
 
     async def _emit_log(
@@ -434,9 +437,28 @@ class Aria2JobSupervisor:
 
     async def _apply_command(self, cmd: JobCommand) -> bool:
         """Apply a command; returns True if the worker should terminate the job."""
+        action = cmd.action
+        if action == "cancel":
+            self._cancelled = True
+            self._delete_on_cancel = cmd.delete_files
+            if self._rpc and self._active_gid:
+                with contextlib.suppress(Exception):
+                    await self._rpc.force_remove(self._active_gid)
+            self.job.status = JobStatus.CANCELLED
+            self.job.download_speed = 0
+            self.job.upload_speed = 0
+            self.job.eta_seconds = None
+            self.job.updated_at = time.time()
+            self.job.finished_at = self.job.updated_at
+            await self._emit_log(
+                f"Cancelled job (delete_files={cmd.delete_files}).",
+                level="WARNING",
+                source="utd-worker",
+            )
+            await self.on_progress(self.job)
+            return True
         if not self._rpc or not self._active_gid:
             return False
-        action = cmd.action
         if action == "pause":
             await self._rpc.pause(self._active_gid)
             self.job.status = JobStatus.PAUSED
@@ -452,17 +474,6 @@ class Aria2JobSupervisor:
             with contextlib.suppress(Exception):
                 await self._rpc.force_remove(self._active_gid)
             await self._emit_log("Stopping seeding and finalizing files.", source="utd-worker")
-            return True
-        elif action == "cancel":
-            self._cancelled = True
-            self._delete_on_cancel = cmd.delete_files
-            with contextlib.suppress(Exception):
-                await self._rpc.force_remove(self._active_gid)
-            await self._emit_log(
-                f"Cancelled job (delete_files={cmd.delete_files}).",
-                level="WARNING",
-                source="utd-worker",
-            )
             return True
         elif action == "update_options" and cmd.options is not None:
             patch: JobOptionsPatch = cmd.options
@@ -506,30 +517,38 @@ class Aria2JobSupervisor:
 
     async def run(self) -> JobInfo:
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.job.status = JobStatus.STARTING
-        self.job.updated_at = time.time()
-        await self.on_progress(self.job)
-
-        cmd_args = build_aria2c_args(
-            output_dir=self.output_dir,
-            rpc_port=self.rpc_port,
-            rpc_secret=self.rpc_secret,
-            options=self.job.options,
-            trackers=self.trackers,
-            is_private=self.is_private,
-            enable_ipv6=_can_listen_on_ipv6(),
-        )
-        await self._emit_log(f"Starting download engine in {self.output_dir}", source="utd-worker")
-
-        self._proc = await asyncio.create_subprocess_exec(
-            *cmd_args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        log_task = asyncio.create_task(self._pump_stream(self._proc.stdout, "aria2c"))
-        self._rpc = Aria2RpcClient(self.rpc_port, self.rpc_secret)
+        log_task: asyncio.Task[None] | None = None
 
         try:
+            if self._cancelled:
+                self.job.status = JobStatus.CANCELLED
+                return self.job
+
+            self.job.status = JobStatus.STARTING
+            self.job.updated_at = time.time()
+            await self.on_progress(self.job)
+
+            cmd_args = build_aria2c_args(
+                output_dir=self.output_dir,
+                rpc_port=self.rpc_port,
+                rpc_secret=self.rpc_secret,
+                options=self.job.options,
+                trackers=self.trackers,
+                is_private=self.is_private,
+                enable_ipv6=_can_listen_on_ipv6(),
+            )
+            await self._emit_log(
+                f"Starting download engine in {self.output_dir}", source="utd-worker"
+            )
+
+            self._proc = await asyncio.create_subprocess_exec(
+                *cmd_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            log_task = asyncio.create_task(self._pump_stream(self._proc.stdout, "aria2c"))
+            self._rpc = Aria2RpcClient(self.rpc_port, self.rpc_secret)
+
             await self._wait_for_rpc_ready(self._rpc)
 
             if self.torrent_bytes is not None:
@@ -560,6 +579,8 @@ class Aria2JobSupervisor:
 
                 assert self._active_gid is not None
                 status_payload = await self._rpc.tell_status(self._active_gid)
+                if self._cancelled:
+                    continue
                 parsed = parse_aria2_status(
                     status_payload,
                     previous_status=self.job.status,
@@ -654,9 +675,13 @@ class Aria2JobSupervisor:
                 self.job.eta_seconds = None
 
         except Exception as exc:
-            self.job.status = JobStatus.ERROR
-            self.job.error = str(exc)
-            await self._emit_log(f"Worker error: {exc}", level="ERROR", source="utd-worker")
+            if self._cancelled:
+                self.job.status = JobStatus.CANCELLED
+                self.job.error = None
+            else:
+                self.job.status = JobStatus.ERROR
+                self.job.error = str(exc)
+                await self._emit_log(f"Worker error: {exc}", level="ERROR", source="utd-worker")
         finally:
             if self._rpc:
                 with contextlib.suppress(Exception):
@@ -668,8 +693,9 @@ class Aria2JobSupervisor:
                 except TimeoutError:
                     self._proc.kill()
                     await self._proc.wait()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(log_task, timeout=2.0)
+            if log_task is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(log_task, timeout=2.0)
 
             if self._cancelled and self._delete_on_cancel:
                 await asyncio.to_thread(self._cleanup_cancelled_files)

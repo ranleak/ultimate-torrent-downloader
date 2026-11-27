@@ -5,6 +5,7 @@ const state = {
   selectedJobId: null,
   jobs: new Map(),
   jobLogs: new Map(),
+  cancelledJobIds: new Set(),
   transfers: new Map(),
   currentDir: "",
   entries: [],
@@ -81,7 +82,9 @@ async function apiJson(url, opts = {}) {
     } catch {
       detail = (await resp.text()) || detail;
     }
-    throw new Error(detail);
+    const err = new Error(detail);
+    err.status = resp.status;
+    throw err;
   }
   return resp.json();
 }
@@ -264,8 +267,34 @@ $("#submit-form").addEventListener("submit", async (e) => {
 
 // ==================== Jobs State & Rendering ====================
 
+function isJobCancelled(job) {
+  return Boolean(job && (job.status === "cancelled" || state.cancelledJobIds.has(job.job_id)));
+}
+
+function removeJob(jobId) {
+  if (!jobId) return;
+  const hadJob = state.jobs.delete(jobId);
+  state.jobLogs.delete(jobId);
+  if (state.selectedJobId === jobId) {
+    state.selectedJobId = null;
+    if (state.sse) {
+      state.sse.close();
+      state.sse = null;
+    }
+    renderInspector();
+  }
+  if (hadJob) {
+    renderJobs();
+    updateAggregateMetrics();
+  }
+}
+
 function upsertJob(job) {
   if (!job || !job.job_id) return;
+  if (isJobCancelled(job)) {
+    removeJob(job.job_id);
+    return;
+  }
   const existing = state.jobs.get(job.job_id);
   const merged = existing ? { ...existing, ...job } : job;
   if (Array.isArray(job.logs) && job.logs.length > 0) {
@@ -282,7 +311,7 @@ function upsertJob(job) {
 }
 
 function appendLog(jobId, logEvt) {
-  if (!jobId || !logEvt) return;
+  if (!jobId || !logEvt || state.cancelledJobIds.has(jobId) || !state.jobs.has(jobId)) return;
   const logsMap = state.jobLogs.get(jobId) || new Map();
   logsMap.set(logEvt.seq, logEvt);
   if (logsMap.size > 600) {
@@ -300,6 +329,7 @@ function updateAggregateMetrics() {
   let ul = 0;
   let active = 0;
   for (const job of state.jobs.values()) {
+    if (isJobCancelled(job)) continue;
     dl += Number(job.download_speed || 0);
     ul += Number(job.upload_speed || 0);
     if (!["completed", "cancelled", "error"].includes(job.status)) {
@@ -314,7 +344,9 @@ function updateAggregateMetrics() {
 
 function renderJobs() {
   const container = $("#jobs-list");
-  const sorted = Array.from(state.jobs.values()).sort((a, b) => b.created_at - a.created_at);
+  const sorted = Array.from(state.jobs.values())
+    .filter((job) => !isJobCancelled(job))
+    .sort((a, b) => b.created_at - a.created_at);
   if (sorted.length === 0) {
     container.innerHTML =
       '<div class="empty-state">No torrents yet. Paste a magnet link or drop a .torrent file above.</div>';
@@ -324,7 +356,7 @@ function renderJobs() {
   container.innerHTML = sorted
     .map((job) => {
       const selectedCls = job.job_id === state.selectedJobId ? "selected" : "";
-      const isTerminal = ["completed", "cancelled", "error"].includes(job.status);
+      const isTerminal = ["completed", "error"].includes(job.status);
       const isPaused = job.status === "paused";
       const isSeeding = job.status === "seeding";
 
@@ -332,7 +364,7 @@ function renderJobs() {
       if (!isTerminal && !isPaused) {
         actionButtons.push(`<button class="btn btn-ghost btn-xs" data-act="pause" data-id="${job.job_id}">Pause</button>`);
       }
-      if (isPaused || job.status === "error" || job.status === "cancelled") {
+      if (isPaused || job.status === "error") {
         actionButtons.push(`<button class="btn btn-ghost btn-xs" data-act="resume" data-id="${job.job_id}">Resume</button>`);
       }
       if (isSeeding) {
@@ -371,8 +403,14 @@ $("#jobs-list").addEventListener("click", async (e) => {
   const actBtn = e.target.closest("button[data-act]");
   if (actBtn) {
     e.stopPropagation();
+    if (actBtn.disabled) return;
     const { act, id } = actBtn.dataset;
-    await handleJobAction(act, id);
+    actBtn.disabled = true;
+    try {
+      await handleJobAction(act, id);
+    } finally {
+      if (actBtn.isConnected) actBtn.disabled = false;
+    }
     return;
   }
   const card = e.target.closest(".job-card");
@@ -408,21 +446,38 @@ async function handleJobAction(action, jobId) {
     if (action === "delete") {
       const delFiles = window.confirm("Also delete downloaded files from Modal Volume? (Cancel keeps files)");
       await apiJson(`/api/jobs/${jobId}?delete_files=${delFiles}`, { method: "DELETE" });
-      state.jobs.delete(jobId);
-      state.jobLogs.delete(jobId);
-      if (state.selectedJobId === jobId) {
-        state.selectedJobId = null;
-        renderInspector();
-      }
-      renderJobs();
-      updateAggregateMetrics();
+      removeJob(jobId);
       return;
     }
-    const endpoint =
-      action === "cancel"
-        ? `/api/jobs/${jobId}/cancel`
-        : `/api/jobs/${jobId}/${action}`;
-    const updated = await apiJson(endpoint, { method: "POST" });
+    if (action === "cancel") {
+      const prevJob = state.jobs.get(jobId);
+      const prevLogs = state.jobLogs.get(jobId);
+      const wasSelected = state.selectedJobId === jobId;
+      state.cancelledJobIds.add(jobId);
+      removeJob(jobId);
+      try {
+        await apiJson(`/api/jobs/${jobId}/cancel`, { method: "POST" });
+      } catch (err) {
+        if (err.status === 404) {
+          return;
+        }
+        state.cancelledJobIds.delete(jobId);
+        if (prevLogs) {
+          state.jobLogs.set(jobId, prevLogs);
+        }
+        if (prevJob) {
+          upsertJob(prevJob);
+          if (wasSelected) {
+            await selectJob(jobId);
+          }
+        } else {
+          await loadJobs();
+        }
+        throw err;
+      }
+      return;
+    }
+    const updated = await apiJson(`/api/jobs/${jobId}/${action}`, { method: "POST" });
     upsertJob(updated);
   } catch (err) {
     showToast(err.message, "error");
@@ -430,14 +485,24 @@ async function handleJobAction(action, jobId) {
 }
 
 async function selectJob(jobId) {
+  if (!jobId || state.cancelledJobIds.has(jobId)) return;
   state.selectedJobId = jobId;
   renderJobs();
   let full = state.jobs.get(jobId);
   try {
     full = await apiJson(`/api/jobs/${jobId}`);
+    if (isJobCancelled(full)) {
+      removeJob(jobId);
+      return;
+    }
+    if (state.selectedJobId !== jobId) return;
     upsertJob(full);
   } catch {
+    if (state.selectedJobId !== jobId) return;
     renderInspector();
+  }
+  if (state.selectedJobId !== jobId || !state.jobs.has(jobId)) {
+    return;
   }
   if (full && !["completed", "cancelled", "error"].includes(full.status)) {
     openJobSseFallback(jobId);
@@ -558,9 +623,26 @@ async function loadJobs() {
   try {
     const jobs = await apiJson("/api/jobs");
     state.jobs.clear();
-    for (const j of jobs) upsertJob(j);
-    if (!state.selectedJobId && jobs.length > 0) {
-      selectJob(jobs[0].job_id);
+    for (const j of jobs) {
+      if (isJobCancelled(j)) {
+        state.jobLogs.delete(j.job_id);
+      } else {
+        upsertJob(j);
+      }
+    }
+    if (state.selectedJobId && !state.jobs.has(state.selectedJobId)) {
+      state.selectedJobId = null;
+      if (state.sse) {
+        state.sse.close();
+        state.sse = null;
+      }
+    }
+    renderJobs();
+    updateAggregateMetrics();
+    renderInspector();
+    if (!state.selectedJobId && state.jobs.size > 0) {
+      const newest = Array.from(state.jobs.values()).sort((a, b) => b.created_at - a.created_at)[0];
+      if (newest) selectJob(newest.job_id);
     }
   } catch {
     // Ignore when unconfigured
@@ -574,7 +656,7 @@ function openJobSseFallback(jobId, force = false) {
     state.sse.close();
     state.sse = null;
   }
-  if (!jobId) return;
+  if (!jobId || state.cancelledJobIds.has(jobId)) return;
   // Open SSE directly for the inspected job if WebSocket is disconnected or user forced reconnect.
   if (!force && state.ws && state.ws.readyState === WebSocket.OPEN) {
     // Still connect per-job SSE so logs stream immediately even when WS is multiplexed!

@@ -22,7 +22,7 @@ from utd.cloud.aria2_engine import (
     find_free_tcp_port,
     parse_aria2_status,
 )
-from utd.shared.models import JobInfo, JobStatus, TorrentOptions
+from utd.shared.models import JobCommand, JobInfo, JobStatus, TorrentOptions
 
 
 def test_build_aria2c_args_speed_and_volume_flags(tmp_path: Path) -> None:
@@ -280,3 +280,89 @@ async def test_aria2_rpc_client_against_mock_server() -> None:
         await client.close()
         server.should_exit = True
         await task
+
+
+@pytest.mark.asyncio
+async def test_supervisor_cancel_transitions_cleanly_to_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+    rpc_app = FastAPI()
+    port = find_free_tcp_port()
+    job = JobInfo(job_id="cancel-sup", name="Arch.iso", source_type="magnet")
+    statuses_seen: list[JobStatus] = []
+
+    async def on_progress(updated: JobInfo) -> None:
+        statuses_seen.append(updated.status)
+
+    supervisor = Aria2JobSupervisor(
+        job=job,
+        output_dir=tmp_path,
+        source_uri="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Arch.iso",
+        on_progress=on_progress,
+        on_log=AsyncMock(),
+        rpc_port=port,
+        poll_interval=5.0,
+    )
+
+    @rpc_app.post("/jsonrpc")
+    async def handle_rpc(req: Request):
+        body = json.loads(await req.body())
+        method = body["method"]
+        calls.append(method)
+        if method == "aria2.getVersion":
+            return {"jsonrpc": "2.0", "id": body["id"], "result": {"version": "1.37.0"}}
+        if method == "aria2.addUri":
+            return {"jsonrpc": "2.0", "id": body["id"], "result": "gid-arch"}
+        if method == "aria2.tellStatus":
+            return {
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {
+                    "gid": "gid-arch",
+                    "status": "active",
+                    "totalLength": "1000",
+                    "completedLength": "250",
+                    "downloadSpeed": "100",
+                    "uploadSpeed": "10",
+                    "bittorrent": {"info": {"name": "Arch.iso"}},
+                },
+            }
+        return {"jsonrpc": "2.0", "id": body["id"], "result": "OK"}
+
+    class DummyProc:
+        returncode = None
+        stdout = None
+
+        async def wait(self) -> int:
+            self.returncode = 0
+            return 0
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=DummyProc()))
+
+    server = uvicorn.Server(uvicorn.Config(rpc_app, host="127.0.0.1", port=port, log_level="error"))
+    srv_task = asyncio.create_task(server.serve())
+    await asyncio.sleep(0.15)
+
+    try:
+        run_task = asyncio.create_task(supervisor.run())
+        for _ in range(40):
+            if JobStatus.DOWNLOADING in statuses_seen:
+                break
+            await asyncio.sleep(0.05)
+        assert JobStatus.DOWNLOADING in statuses_seen
+
+        await supervisor.enqueue_command(JobCommand(action="cancel"))
+        final_job = await asyncio.wait_for(run_task, timeout=3.0)
+        assert final_job.status == JobStatus.CANCELLED
+        assert final_job.error is None
+        assert final_job.download_speed == 0
+        assert final_job.upload_speed == 0
+        assert final_job.eta_seconds is None
+        assert "aria2.forceRemove" in calls
+    finally:
+        server.should_exit = True
+        await srv_task

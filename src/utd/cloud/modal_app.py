@@ -437,6 +437,24 @@ class ModalTorrentBackend:
                 job.options.max_peers = patch.max_peers
             job.updated_at = time.time()
             await jobs_dict.put.aio(job.job_id, job.model_dump())
+        elif command.action == "cancel":
+            job.status = JobStatus.CANCELLED
+            job.download_speed = 0
+            job.upload_speed = 0
+            job.eta_seconds = None
+            job.updated_at = time.time()
+            job.finished_at = job.updated_at
+            await jobs_dict.put.aio(job.job_id, job.model_dump())
+            evt = StreamEvent(
+                type="status",
+                job_id=job.job_id,
+                ts=job.updated_at,
+                data=job.model_dump(exclude={"logs"}),
+            ).model_dump()
+            with contextlib.suppress(Exception):
+                await logs_queue.put.aio(evt, partition=_job_partition(job.job_id))
+            with contextlib.suppress(Exception):
+                await logs_queue.put.aio(evt, partition="__all__", partition_ttl=3600)
 
         await control_queue.put.aio(command.model_dump(), partition=job_id)
         return job
