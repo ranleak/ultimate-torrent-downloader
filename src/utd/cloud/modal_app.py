@@ -12,10 +12,13 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-# Ensure `utd` package is discoverable whether invoked via `uv run` or raw `modal deploy`.
-_SRC_DIR = Path(__file__).resolve().parents[2]
-if str(_SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(_SRC_DIR))
+# Add the src directory for a local file-based deploy. In the container this
+# file also exists at /root/modal_app.py, alongside the already importable utd package.
+_APP_DIR = Path(__file__).resolve().parent
+if _APP_DIR.name == "cloud" and _APP_DIR.parent.name == "utd":
+    _SRC_DIR = _APP_DIR.parent.parent
+    if str(_SRC_DIR) not in sys.path:
+        sys.path.insert(0, str(_SRC_DIR))
 
 import modal  # noqa: E402
 
@@ -108,6 +111,10 @@ ubuntu_image = (
         "websockets>=14.0",
     )
     .add_local_python_source("utd", ignore=_ignore_non_cloud_files)
+    # File-based `modal deploy` imports this entrypoint as `modal_app`, not
+    # `utd.cloud.modal_app`. include_source=False disables Modal's implicit
+    # entrypoint mount, so explicitly provide that top-level module as well.
+    .add_local_file(Path(__file__), remote_path="/root/modal_app.py")
 )
 
 app = modal.App(name=APP_NAME, image=ubuntu_image, include_source=False)
