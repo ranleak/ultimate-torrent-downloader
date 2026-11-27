@@ -1,0 +1,25 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# Windows installer build artifacts & caches
+.cache/
+installer/windows/build/
+installer/windows/dist/
+*.exe
+*.sha256
+
+# Local user state
+*.log
+.env
+.env.*
