@@ -4,21 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
 import uvicorn
 from fastapi import FastAPI, Request
 
 from utd.cloud.aria2_engine import (
+    Aria2JobSupervisor,
     Aria2RpcClient,
     Aria2RpcError,
+    _can_listen_on_ipv6,
     build_aria2c_args,
     find_free_tcp_port,
     parse_aria2_status,
 )
-from utd.shared.models import JobStatus, TorrentOptions
+from utd.shared.models import JobInfo, JobStatus, TorrentOptions
 
 
 def test_build_aria2c_args_speed_and_volume_flags(tmp_path: Path) -> None:
@@ -47,6 +51,7 @@ def test_build_aria2c_args_speed_and_volume_flags(tmp_path: Path) -> None:
     assert "--bt-prioritize-piece=head=32M,tail=4M" in args
     assert "--select-file=1,3" in args
     assert any(a.startswith("--bt-tracker=https://custom.example/ann") for a in args)
+    assert "--dht-entry-point=router.bittorrent.com:6881" in args
 
     priv_args = build_aria2c_args(
         output_dir=tmp_path,
@@ -56,7 +61,92 @@ def test_build_aria2c_args_speed_and_volume_flags(tmp_path: Path) -> None:
         trackers=["https://priv.example/ann"],
         is_private=True,
     )
-    assert not any(a.startswith("--bt-tracker=") for a in priv_args)
+    assert not any(a.startswith(("--bt-tracker=", "--dht-entry-point=")) for a in priv_args)
+
+
+@pytest.mark.parametrize("failure", ["addrconfig", "bind", None])
+def test_ipv6_listeners_require_a_usable_address(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str | None
+) -> None:
+    # A build with IPv6 support can still run in an IPv4-only container.
+    monkeypatch.setattr(socket, "has_ipv6", True)
+    addr = ("::1", 0, 0, 0)
+    resolve = Mock(return_value=[(socket.AF_INET6, socket.SOCK_STREAM, 6, "", addr)])
+    if failure == "addrconfig":
+        resolve.side_effect = socket.gaierror("Name or service not known")
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    sock = MagicMock()
+    if failure == "bind":
+        sock.__enter__.return_value.bind.side_effect = OSError("Cannot assign requested address")
+    monkeypatch.setattr(socket, "socket", Mock(return_value=sock))
+
+    ipv6 = _can_listen_on_ipv6()
+    resolve.assert_called_once_with(
+        None, 0, socket.AF_INET6, socket.SOCK_STREAM, flags=socket.AI_ADDRCONFIG
+    )
+    assert ipv6 is (failure is None)
+    args = build_aria2c_args(
+        output_dir=tmp_path,
+        rpc_port=6800,
+        rpc_secret="secret",
+        options=TorrentOptions(extra_trackers=False),
+        enable_ipv6=ipv6,
+    )
+    if ipv6:
+        assert "--disable-ipv6=true" not in args
+        assert "--enable-dht6=true" in args
+    else:
+        assert "--disable-ipv6=true" in args
+        assert "--enable-dht6=false" in args
+        assert "--enable-dht6=true" not in args
+    assert "--enable-dht=true" in args
+    assert not any(a.startswith("--dht-entry-point=") for a in args)
+    assert "--rpc-listen-all=false" in args
+    assert "--enable-color=false" in args
+
+
+@pytest.mark.asyncio
+async def test_only_missing_dht_cache_is_informational(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = JobInfo(job_id="cache-test", name="test", source_type="torrent")
+    worker = Aria2JobSupervisor(
+        job=job, output_dir=tmp_path, on_progress=AsyncMock(), on_log=AsyncMock(), rpc_port=6800
+    )
+    cache_home = tmp_path / "worker cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
+    missing = cache_home / "aria2" / "dht.dat"
+    corrupt = missing.with_name("dht6.dat")
+    corrupt.parent.mkdir(parents=True)
+    corrupt.write_bytes(b"bad header")
+    header = "11/27 23:06:44 [ERROR] Exception caught while loading DHT routing table from "
+    detail = (
+        "Exception: [DHTRoutingTableDeserializer.cc:82] errorCode=1 "
+        "Failed to load DHT routing table from "
+    )
+    corrupt_detail = f"{detail}{corrupt}. cause:bad header"
+    bind_error = "11/27 23:06:44 [ERROR] IPv4 DHT: failed to bind UDP port 6914"
+    socket_error = "Exception: [SocketCore.cc:312] errorCode=1 Failed to bind a socket"
+    lines = [
+        f"{header}{missing}",
+        f"{detail}{missing}",
+        f"{header}{corrupt}",
+        corrupt_detail,
+        bind_error,
+        socket_error,
+    ]
+    stream = asyncio.StreamReader()
+    stream.feed_data("\n".join(lines).encode())
+    stream.feed_eof()
+    await worker._pump_stream(stream, "aria2c")
+
+    assert [(event.level, event.message) for event in job.logs] == [
+        ("INFO", f"No saved DHT routing table at {missing}; starting with an empty table."),
+        ("ERROR", f"{header}{corrupt}"),
+        ("ERROR", corrupt_detail),
+        ("ERROR", bind_error),
+        ("ERROR", socket_error),
+    ]
 
 
 def test_parse_aria2_status_transitions() -> None:
