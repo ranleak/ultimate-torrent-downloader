@@ -66,7 +66,9 @@ uv run python scripts/deploy_modal.py
 2. Deploys `src/utd/cloud/modal_app.py`.
 3. Queries `WebGateway().web.get_web_url()` and writes both the URL and token into your local client configuration.
 
-After updating the cloud backend, run `uv run python scripts/deploy_modal.py` again to deploy the changes. Existing deployments need to be redeployed to pick up the corrected Modal entrypoint source.
+After updating the cloud backend, run `uv run python scripts/deploy_modal.py` again, then start a new job to use the updated worker.
+
+The worker keeps IPv4 peer discovery enabled and only starts IPv6 listeners if a local IPv6 bind succeeds. `No saved DHT routing table` is normal on a fresh worker; aria2 builds the table as it discovers peers. For public torrents with extra trackers enabled, the worker also supplies an IPv4 DHT bootstrap node. You don't need to create `dht.dat` or open the RPC port.
 
 ### 3. Launch the Local Client
 

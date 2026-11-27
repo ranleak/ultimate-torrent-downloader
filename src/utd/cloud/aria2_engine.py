@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import logging
+import os
 import secrets
 import shutil
 import socket
@@ -37,6 +38,24 @@ def find_free_tcp_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _can_listen_on_ipv6() -> bool:
+    if not socket.has_ipv6:
+        return False
+    try:
+        # Match aria2's loopback RPC listener. A kernel may support ::1 but have
+        # no configured IPv6 interface, in which case AI_ADDRCONFIG rejects it.
+        addresses = socket.getaddrinfo(
+            None, 0, socket.AF_INET6, socket.SOCK_STREAM, flags=socket.AI_ADDRCONFIG
+        )
+        if not addresses:
+            return False
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+            sock.bind(addresses[0][4])
+    except OSError:
+        return False
+    return True
+
+
 def build_aria2c_args(
     *,
     output_dir: Path,
@@ -45,6 +64,7 @@ def build_aria2c_args(
     options: TorrentOptions,
     trackers: list[str] | None = None,
     is_private: bool = False,
+    enable_ipv6: bool = False,
 ) -> list[str]:
     """Construct speed-optimized headless aria2c CLI flags for Modal Volume storage."""
     args = [
@@ -68,7 +88,7 @@ def build_aria2c_args(
         f"--bt-max-peers={options.max_peers}",
         "--bt-request-peer-speed-limit=20M",
         "--enable-dht=true",
-        "--enable-dht6=true",
+        "--enable-dht6=true" if enable_ipv6 else "--enable-dht6=false",
         "--dht-listen-port=6881-6999",
         "--listen-port=6881-6999",
         "--enable-peer-exchange=true",
@@ -82,8 +102,12 @@ def build_aria2c_args(
         f"--seed-ratio={options.seed_ratio}",
         "--summary-interval=10",
         "--console-log-level=notice",
+        "--enable-color=false",
         "--show-console-readout=false",
     ]
+    if not enable_ipv6:
+        # Disabling DHT6 alone would still start IPv6 RPC and BitTorrent listeners.
+        args.append("--disable-ipv6=true")
     if options.bt_stop_timeout > 0:
         args.append(f"--bt-stop-timeout={options.bt_stop_timeout}")
     if options.sequential:
@@ -91,6 +115,9 @@ def build_aria2c_args(
     if options.selected_files:
         args.append("--select-file=" + ",".join(str(i) for i in options.selected_files))
     if options.extra_trackers and not is_private:
+        # aria2 has no default bootstrap node. Public jobs can discover IPv4 DHT
+        # peers on a cold worker without a pre-populated dht.dat.
+        args.append("--dht-entry-point=router.bittorrent.com:6881")
         tracker_csv = merged_trackers_csv(trackers, is_private=is_private)
         if tracker_csv:
             args.append(f"--bt-tracker={tracker_csv}")
@@ -159,6 +186,26 @@ class Aria2RpcClient:
 
     async def shutdown(self) -> str:
         return str(await self.call("aria2.forceShutdown"))
+
+
+def _missing_dht_tables() -> set[Path]:
+    """Snapshot missing default caches before submission; don't stat paths from logs."""
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME", ""))
+    if not cache_home.is_absolute():
+        try:
+            cache_home = Path.home() / ".cache"
+        except RuntimeError:  # No home directory; leave the logs unchanged.
+            return set()
+    missing: set[Path] = set()
+    for name in ("dht.dat", "dht6.dat"):
+        path = cache_home / "aria2" / name
+        try:
+            path.stat()
+        except FileNotFoundError:
+            missing.add(path)
+        except OSError:
+            pass  # Unreadable isn't the same as missing; keep aria2's diagnostic.
+    return missing
 
 
 def _classify_log_level(line: str) -> str:
@@ -338,6 +385,8 @@ class Aria2JobSupervisor:
     async def _pump_stream(self, stream: asyncio.StreamReader | None, source: str) -> None:
         if stream is None:
             return
+        cold_tables = _missing_dht_tables()
+        missing_table = None
         while True:
             raw = await stream.readline()
             if not raw:
@@ -345,8 +394,27 @@ class Aria2JobSupervisor:
             line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
-            level = _classify_log_level(line)
-            await self._emit_log(line, level=level, source=source)
+            # aria2 1.37 reports a cold cache as a two-line exception, then creates
+            # its own routing table. Don't swallow other load, bind or save failures.
+            if (
+                missing_table is not None
+                and line.startswith("Exception: [DHTRoutingTableDeserializer.cc:")
+                and line.endswith(f" Failed to load DHT routing table from {missing_table}")
+            ):
+                missing_table = None
+                continue
+            _, header, path = line.partition(
+                "[ERROR] Exception caught while loading DHT routing table from "
+            )
+            if header and Path(path) in cold_tables:
+                missing_table = path
+                await self._emit_log(
+                    f"No saved DHT routing table at {path}; starting with an empty table.",
+                    source=source,
+                )
+            else:
+                missing_table = None
+                await self._emit_log(line, level=_classify_log_level(line), source=source)
 
     async def _wait_for_rpc_ready(self, rpc: Aria2RpcClient) -> None:
         for _ in range(50):
@@ -449,6 +517,7 @@ class Aria2JobSupervisor:
             options=self.job.options,
             trackers=self.trackers,
             is_private=self.is_private,
+            enable_ipv6=_can_listen_on_ipv6(),
         )
         await self._emit_log(f"Starting download engine in {self.output_dir}", source="utd-worker")
 
