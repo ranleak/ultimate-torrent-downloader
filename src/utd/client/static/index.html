@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ultimate Torrent Downloader · Modal Cloud</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Header -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3v12" />
+            <path d="m7 11 5 5 5-5" />
+            <path d="M4 19h16" />
+          </svg>
+        </div>
+        <div>
+          <h1>Ultimate Torrent Downloader</h1>
+          <span class="subtitle">Modal.com Fluid Compute &amp; Volume Bridge</span>
+        </div>
+      </div>
+
+      <div class="telemetry-strip">
+        <div class="metric-pill">
+          <span class="metric-label">Cloud ↓</span>
+          <span id="total-dl-speed" class="metric-value mono">0 B/s</span>
+        </div>
+        <div class="metric-pill">
+          <span class="metric-label">Cloud ↑</span>
+          <span id="total-ul-speed" class="metric-value mono">0 B/s</span>
+        </div>
+        <div class="metric-pill">
+          <span class="metric-label">Active</span>
+          <span id="active-jobs-count" class="metric-value mono">0</span>
+        </div>
+        <button id="conn-pill" class="conn-pill conn-unconfigured" type="button" title="Configure Modal Endpoint">
+          <span class="dot"></span>
+          <span id="conn-label">Not Configured</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Tab Navigation -->
+    <nav class="nav-tabs" aria-label="Main Navigation">
+      <button class="tab-btn active" data-tab="torrents" type="button">
+        <span>Torrents</span>
+        <span id="badge-jobs" class="tab-badge">0</span>
+      </button>
+      <button class="tab-btn" data-tab="explorer" type="button">
+        <span>Volume Explorer</span>
+      </button>
+      <button class="tab-btn" data-tab="transfers" type="button">
+        <span>PC Transfers</span>
+        <span id="badge-transfers" class="tab-badge">0</span>
+      </button>
+      <button class="tab-btn" data-tab="settings" type="button">
+        <span>Settings</span>
+      </button>
+    </nav>
+
+    <!-- Setup Banner when Modal Endpoint is unconfigured -->
+    <div id="setup-banner" class="banner hidden">
+      <div>
+        <strong>Connect your Modal.com backend</strong>
+        <span>Deploy the cloud app (`utd deploy`) or enter your Modal FastAPI endpoint URL and API token in Settings.</span>
+      </div>
+      <button id="banner-open-settings" class="btn btn-primary btn-sm" type="button">Open Settings</button>
+    </div>
+
+    <main class="main-content">
+      <!-- ==================== TORRENTS TAB ==================== -->
+      <section id="tab-torrents" class="tab-panel active">
+        <div class="card composer-card">
+          <div class="composer-header">
+            <div class="segmented" role="tablist">
+              <button class="seg-btn active" data-source="magnet" type="button">Magnet / URL</button>
+              <button class="seg-btn" data-source="torrent" type="button">.torrent File</button>
+            </div>
+            <button id="toggle-options-btn" class="btn btn-ghost btn-sm" type="button">
+              <span>Download Options</span>
+              <span id="options-chevron">▾</span>
+            </button>
+          </div>
+
+          <form id="submit-form">
+            <div id="source-magnet-panel">
+              <textarea
+                id="magnet-input"
+                class="textarea mono"
+                rows="2"
+                placeholder="Paste magnet:?xt=urn:btih:... or direct http(s):// links (one per line for batch)..."
+              ></textarea>
+            </div>
+
+            <div id="source-torrent-panel" class="hidden">
+              <div id="torrent-dropzone" class="dropzone" tabindex="0">
+                <input id="torrent-file-input" type="file" accept=".torrent,application/x-bittorrent" hidden />
+                <p id="dropzone-label">Drop a <strong>.torrent</strong> file here or <span class="link-like">browse</span></p>
+              </div>
+              <div id="torrent-preview" class="torrent-preview hidden">
+                <div class="preview-meta">
+                  <div>
+                    <strong id="preview-name"></strong>
+                    <span id="preview-hash" class="mono muted"></span>
+                  </div>
+                  <div class="preview-actions">
+                    <span id="preview-size" class="mono"></span>
+                    <button id="select-all-files" class="btn btn-ghost btn-xs" type="button">All</button>
+                    <button id="select-none-files" class="btn btn-ghost btn-xs" type="button">None</button>
+                  </div>
+                </div>
+                <div id="preview-files-list" class="preview-files-list"></div>
+              </div>
+            </div>
+
+            <div id="options-drawer" class="options-grid hidden">
+              <label class="field">
+                <span>Volume Subfolder</span>
+                <input id="opt-subdir" type="text" placeholder="e.g. movies or linux-isos" />
+              </label>
+              <label class="field">
+                <span>Max Download Speed</span>
+                <input id="opt-dl-limit" type="text" value="0" placeholder="0 = unlimited, or 50M" />
+              </label>
+              <label class="field">
+                <span>Max Upload Speed</span>
+                <input id="opt-ul-limit" type="text" value="0" placeholder="0 = unlimited, or 10M" />
+              </label>
+              <label class="field">
+                <span>Max Peers (0 = unlimited)</span>
+                <input id="opt-max-peers" type="number" min="0" max="2000" value="128" />
+              </label>
+              <label class="field">
+                <span>Seed Time (min, 0 = cost-saver)</span>
+                <input id="opt-seed-time" type="number" min="0" max="1440" value="0" />
+              </label>
+              <label class="field">
+                <span>Seed Ratio (0.0 = disabled)</span>
+                <input id="opt-seed-ratio" type="number" min="0" max="50" step="0.1" value="0.0" />
+              </label>
+              <label class="field">
+                <span>Disk Cache (MB)</span>
+                <input id="opt-cache-mb" type="number" min="8" max="512" value="64" />
+              </label>
+              <label class="field">
+                <span>Split / Connections</span>
+                <input id="opt-split" type="number" min="1" max="64" value="16" />
+              </label>
+              <label class="checkbox-field">
+                <input id="opt-sequential" type="checkbox" />
+                <span>Sequential Piece Priority</span>
+              </label>
+              <label class="checkbox-field">
+                <input id="opt-extra-trackers" type="checkbox" checked />
+                <span>Boost With Public Trackers</span>
+              </label>
+            </div>
+
+            <div class="composer-footer">
+              <span class="muted hint">Downloads stream directly to persistent Modal Volume storage; containers scale to $0 when finished.</span>
+              <button id="submit-btn" class="btn btn-primary" type="submit">Start Cloud Download</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="torrents-workspace">
+          <!-- Jobs List -->
+          <div class="card jobs-panel">
+            <div class="panel-header">
+              <h2>Jobs Queue</h2>
+              <button id="refresh-jobs-btn" class="btn btn-ghost btn-xs" type="button">Refresh</button>
+            </div>
+            <div id="jobs-list" class="jobs-list">
+              <div class="empty-state">No torrents yet. Paste a magnet link or drop a .torrent file above.</div>
+            </div>
+          </div>
+
+          <!-- Live Job Inspector & Log Console -->
+          <div class="card inspector-panel">
+            <div class="panel-header">
+              <div>
+                <h2 id="inspector-title">Live Inspector</h2>
+                <span id="inspector-subtitle" class="muted mono">Select a job to inspect live container logs &amp; files</span>
+              </div>
+              <div class="segmented segmented-sm">
+                <button class="seg-btn active" data-inspector="logs" type="button">Live Logs</button>
+                <button class="seg-btn" data-inspector="files" type="button">Torrent Files</button>
+              </div>
+            </div>
+
+            <div id="inspector-logs-pane" class="inspector-body">
+              <div class="log-toolbar">
+                <select id="log-level-filter" class="select-sm">
+                  <option value="ALL">All Levels</option>
+                  <option value="INFO">INFO+</option>
+                  <option value="WARNING">WARN+</option>
+                  <option value="ERROR">ERROR</option>
+                </select>
+                <input id="log-search" class="input-sm" type="search" placeholder="Filter logs..." />
+                <label class="checkbox-inline">
+                  <input id="log-autoscroll" type="checkbox" checked />
+                  <span>Auto-scroll</span>
+                </label>
+                <button id="log-sse-toggle" class="btn btn-ghost btn-xs" type="button" title="Switch or reconnect live stream">Reconnect Stream</button>
+                <button id="log-copy-btn" class="btn btn-ghost btn-xs" type="button">Copy</button>
+              </div>
+              <div id="log-console" class="log-console mono"></div>
+            </div>
+
+            <div id="inspector-files-pane" class="inspector-body hidden">
+              <div id="inspector-files-list" class="inspector-files-list">
+                <div class="empty-state">No file list available yet.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== VOLUME EXPLORER TAB ==================== -->
+      <section id="tab-explorer" class="tab-panel">
+        <div class="card explorer-card">
+          <div class="explorer-toolbar">
+            <div class="explorer-nav">
+              <button id="exp-up-btn" class="btn btn-ghost btn-sm" type="button">↑ Up</button>
+              <button id="exp-home-btn" class="btn btn-ghost btn-sm" type="button">Root /</button>
+              <div id="exp-breadcrumbs" class="breadcrumbs"></div>
+            </div>
+            <div class="explorer-actions">
+              <input id="exp-search" class="input-sm" type="search" placeholder="Filter folder..." />
+              <select id="exp-sort" class="select-sm">
+                <option value="name">Sort: Name</option>
+                <option value="size">Sort: Size</option>
+                <option value="mtime">Sort: Modified</option>
+              </select>
+              <button id="exp-refresh-btn" class="btn btn-ghost btn-sm" type="button">Refresh</button>
+            </div>
+          </div>
+
+          <div id="exp-selection-bar" class="selection-bar hidden">
+            <span id="exp-selected-count">0 selected</span>
+            <div class="selection-buttons">
+              <button id="exp-batch-transfer" class="btn btn-primary btn-xs" type="button">Transfer to PC</button>
+              <button id="exp-batch-zip" class="btn btn-ghost btn-xs" type="button">Download .ZIP</button>
+              <button id="exp-batch-delete" class="btn btn-danger btn-xs" type="button">Delete</button>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table class="file-table">
+              <thead>
+                <tr>
+                  <th class="col-check"><input id="exp-check-all" type="checkbox" /></th>
+                  <th>Name</th>
+                  <th class="col-size">Size</th>
+                  <th class="col-date">Modified</th>
+                  <th class="col-ops">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="exp-tbody">
+                <tr><td colspan="5" class="empty-cell">Open Volume Explorer when connected to browse remote files.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== PC TRANSFERS TAB ==================== -->
+      <section id="tab-transfers" class="tab-panel">
+        <div class="card">
+          <div class="panel-header">
+            <div>
+              <h2>Local Device Transfers</h2>
+              <span id="transfers-dest-label" class="muted mono"></span>
+            </div>
+            <button id="open-local-folder-btn" class="btn btn-primary btn-sm" type="button">Open Downloads Folder</button>
+          </div>
+          <div id="transfers-list" class="transfers-list">
+            <div class="empty-state">No transfers yet. Use "Transfer to PC" in Volume Explorer for accelerated multi-stream downloads.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==================== SETTINGS TAB ==================== -->
+      <section id="tab-settings" class="tab-panel">
+        <div class="card settings-card">
+          <h2>Connection &amp; Client Settings</h2>
+          <form id="settings-form" class="settings-form">
+            <div class="options-grid">
+              <label class="field field-wide">
+                <span>Modal FastAPI Endpoint URL</span>
+                <input id="cfg-endpoint" type="url" placeholder="https://your-workspace--ultimate-torrent-downloader-webgateway-web.modal.run" />
+              </label>
+              <label class="field field-wide">
+                <span>API Bearer Token <small id="cfg-token-hint" class="muted"></small></span>
+                <input id="cfg-token" type="password" placeholder="Leave blank to keep existing saved token" autocomplete="off" />
+              </label>
+              <label class="field field-wide">
+                <span>Local PC Download Directory</span>
+                <input id="cfg-local-dir" type="text" />
+              </label>
+              <label class="field">
+                <span>Parallel Range Streams per File</span>
+                <input id="cfg-concurrency" type="number" min="1" max="16" value="4" />
+              </label>
+              <label class="field">
+                <span>Range Chunk Size (MB)</span>
+                <input id="cfg-chunk-mb" type="number" min="1" max="64" value="8" />
+              </label>
+            </div>
+
+            <div class="settings-actions">
+              <button id="test-conn-btn" class="btn btn-ghost" type="button">Test Connection</button>
+              <span id="test-conn-result" class="muted"></span>
+              <button class="btn btn-primary" type="submit">Save Settings</button>
+            </div>
+          </form>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Preview / Rename Modal Dialog -->
+  <dialog id="preview-dialog" class="modal-dialog">
+    <div class="dialog-header">
+      <h3 id="preview-dialog-title">Preview</h3>
+      <button id="preview-dialog-close" class="btn btn-ghost btn-xs" type="button">✕</button>
+    </div>
+    <div id="preview-dialog-body" class="dialog-body"></div>
+  </dialog>
+
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
