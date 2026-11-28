@@ -31,7 +31,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
 from utd.cloud.backend import CloudBackend
-from utd.cloud.volume_store import collect_archive_files, stream_zip_archive
+from utd.cloud.volume_store import (
+    VolumeRateLimitError,
+    collect_archive_files,
+    is_volume_rate_limit_error,
+    stream_zip_archive,
+)
 from utd.shared.bencode import BencodeError
 from utd.shared.models import (
     FileEntryInfo,
@@ -129,6 +134,16 @@ def create_cloud_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.exception_handler(VolumeRateLimitError)
+    async def _handle_volume_rate_limit(
+        _request: Request, exc: VolumeRateLimitError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": str(exc)},
+            headers={"Retry-After": "2"},
+        )
 
     async def require_auth(request: Request) -> None:
         _verify_token(_extract_token_from_request(request), resolved_token, resolved_anon)
@@ -341,6 +356,10 @@ def create_cloud_app(
 
     # --- Modal Volume File Explorer APIs ---
 
+    def _reraise_if_rate_limited(exc: Exception) -> None:
+        if is_volume_rate_limit_error(exc):
+            raise VolumeRateLimitError(str(exc)) from exc
+
     @app.get("/api/files", response_model=list[FileEntryInfo], dependencies=[Depends(require_auth)])
     async def list_files(
         path: str = Query(default=""),
@@ -350,7 +369,11 @@ def create_cloud_app(
             clean = sanitize_volume_path(path)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return await backend.volume.listdir(clean, recursive=recursive)
+        try:
+            return await backend.volume.listdir(clean, recursive=recursive)
+        except Exception as exc:
+            _reraise_if_rate_limited(exc)
+            raise
 
     @app.get("/api/files/stat", response_model=FileEntryInfo, dependencies=[Depends(require_auth)])
     async def stat_file(path: str = Query(...)) -> FileEntryInfo:
@@ -358,7 +381,11 @@ def create_cloud_app(
             clean = sanitize_volume_path(path)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        entry = await backend.volume.stat(clean)
+        try:
+            entry = await backend.volume.stat(clean, refresh=True)
+        except Exception as exc:
+            _reraise_if_rate_limited(exc)
+            raise
         if entry is None:
             raise HTTPException(status_code=404, detail=f"Path not found: {path}")
         return entry
@@ -376,7 +403,11 @@ def create_cloud_app(
         if not clean:
             raise HTTPException(status_code=400, detail="File path is required.")
 
-        entry = await backend.volume.stat(clean)
+        try:
+            entry = await backend.volume.stat(clean)
+        except Exception as exc:
+            _reraise_if_rate_limited(exc)
+            raise
         if entry is None or entry.is_dir:
             raise HTTPException(status_code=404, detail=f"File not found: {path}")
 
@@ -402,7 +433,7 @@ def create_cloud_app(
             headers["Content-Range"] = f"bytes {start}-{end}/{entry.size}"
             headers["Content-Length"] = str(length)
             return StreamingResponse(
-                backend.volume.read_range(clean, start, end),
+                backend.volume.read_range(clean, start, end, entry=entry),
                 status_code=206,
                 media_type=media_type,
                 headers=headers,
@@ -410,7 +441,7 @@ def create_cloud_app(
 
         headers["Content-Length"] = str(entry.size)
         return StreamingResponse(
-            backend.volume.read_range(clean, 0, None),
+            backend.volume.read_range(clean, 0, None, entry=entry),
             status_code=200,
             media_type=media_type,
             headers=headers,
@@ -425,7 +456,11 @@ def create_cloud_app(
             cleaned = [sanitize_volume_path(p) for p in paths]
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        entries = await collect_archive_files(backend.volume, cleaned)
+        try:
+            entries = await collect_archive_files(backend.volume, cleaned)
+        except Exception as exc:
+            _reraise_if_rate_limited(exc)
+            raise
         if not entries:
             raise HTTPException(
                 status_code=404, detail="No files found for requested archive paths."
@@ -451,6 +486,9 @@ def create_cloud_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            _reraise_if_rate_limited(exc)
+            raise
         return JSONResponse({"renamed": True, "src_path": req.src_path, "dst_path": req.dst_path})
 
     @app.delete("/api/files", dependencies=[Depends(require_auth)])
@@ -466,6 +504,9 @@ def create_cloud_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except IsADirectoryError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            _reraise_if_rate_limited(exc)
+            raise
         return JSONResponse({"deleted": True, "path": path})
 
     return app

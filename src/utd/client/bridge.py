@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import random
 import re
 import threading
 import time
@@ -19,8 +20,42 @@ import websockets
 from pydantic import BaseModel, Field
 
 from utd.client.config import ClientConfig
+from utd.shared.models import sanitize_volume_path
 
 _WIN_UNSAFE = re.compile(r'[<>:"|?*\x00-\x1f]')
+_NON_RETRYABLE_STATUS_CODES = frozenset({400, 401, 403, 404, 416})
+
+
+def _parse_retry_after(raw: str | None) -> float | None:
+    if not raw:
+        return None
+    with contextlib.suppress(ValueError):
+        val = float(raw.strip())
+        if val >= 0:
+            return min(val, 15.0)
+    return None
+
+
+class _DynamicLimiter:
+    """Async concurrency limiter whose slot cap adapts dynamically to live configuration."""
+
+    def __init__(self, limit_getter: Callable[[], int]) -> None:
+        self._limit_getter = limit_getter
+        self._active = 0
+        self._cond = asyncio.Condition()
+
+    @contextlib.asynccontextmanager
+    async def acquire(self) -> AsyncIterator[None]:
+        async with self._cond:
+            while self._active >= max(1, self._limit_getter()):
+                await self._cond.wait()
+            self._active += 1
+        try:
+            yield
+        finally:
+            async with self._cond:
+                self._active -= 1
+                self._cond.notify_all()
 
 
 def sanitize_local_relpath(remote_path: str) -> Path:
@@ -57,10 +92,17 @@ class TransferItem(BaseModel):
 class ModalBridgeError(RuntimeError):
     """Raised when the remote Modal API rejects or fails a request."""
 
-    def __init__(self, status_code: int, detail: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        detail: str,
+        *,
+        retry_after: float | None = None,
+    ) -> None:
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+        self.retry_after = retry_after
 
 
 class ModalBridgeClient:
@@ -70,12 +112,17 @@ class ModalBridgeClient:
         self,
         config_getter: Callable[[], ClientConfig],
         transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        rate_limit_retries: int = 4,
+        rate_limit_base_delay: float = 0.5,
     ) -> None:
         self._config_getter = config_getter
         self._transport = transport
+        self._rate_limit_retries = max(0, rate_limit_retries)
+        self._rate_limit_base_delay = max(0.01, rate_limit_base_delay)
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0, connect=10.0, read=140.0),
-            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+            limits=httpx.Limits(max_connections=48, max_keepalive_connections=24),
             follow_redirects=True,
             transport=transport,
         )
@@ -121,27 +168,45 @@ class ModalBridgeClient:
         data: Any = None,
     ) -> Any:
         url = f"{self._base_url()}{path}"
-        try:
-            resp = await self._client.request(
-                method,
-                url,
-                headers=self._headers(),
-                params=params,
-                json=json_body,
-                files=files,
-                data=data,
-            )
-        except httpx.HTTPError as exc:
-            raise ModalBridgeError(502, f"Upstream Modal request failed: {exc}") from exc
-
-        if resp.status_code >= 400:
+        attempt = 0
+        while True:
             try:
-                err_json = resp.json()
-                detail = str(err_json.get("detail", resp.text))
-            except Exception:
-                detail = resp.text or f"HTTP {resp.status_code}"
-            raise ModalBridgeError(resp.status_code, detail)
-        return resp.json()
+                resp = await self._client.request(
+                    method,
+                    url,
+                    headers=self._headers(),
+                    params=params,
+                    json=json_body,
+                    files=files,
+                    data=data,
+                )
+            except httpx.HTTPError as exc:
+                raise ModalBridgeError(502, f"Upstream Modal request failed: {exc}") from exc
+
+            if resp.status_code == 429 and attempt < self._rate_limit_retries:
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                delay = (
+                    retry_after
+                    if retry_after is not None
+                    else min(8.0, self._rate_limit_base_delay * (2**attempt))
+                    * random.uniform(0.85, 1.15)
+                )
+                attempt += 1
+                await asyncio.sleep(delay)
+                continue
+
+            if resp.status_code >= 400:
+                try:
+                    err_json = resp.json()
+                    detail = str(err_json.get("detail", resp.text))
+                except Exception:
+                    detail = resp.text or f"HTTP {resp.status_code}"
+                raise ModalBridgeError(
+                    resp.status_code,
+                    detail,
+                    retry_after=_parse_retry_after(resp.headers.get("Retry-After")),
+                )
+            return resp.json()
 
     async def test_connection(self, endpoint_url: str, api_token: str) -> dict[str, Any]:
         base = endpoint_url.strip().rstrip("/")
@@ -181,12 +246,13 @@ class ModalBridgeClient:
         req = self._client.build_request("GET", url, headers=headers, params=params)
         resp = await self._client.send(req, stream=True)
         if resp.status_code >= 400:
+            retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
             body = await resp.aread()
             await resp.aclose()
             detail = body.decode("utf-8", errors="replace")
             with contextlib.suppress(Exception):
                 detail = str(json.loads(detail).get("detail", detail))
-            raise ModalBridgeError(resp.status_code, detail)
+            raise ModalBridgeError(resp.status_code, detail, retry_after=retry_after)
 
         resp_headers = {
             k: v
@@ -254,6 +320,12 @@ class LocalTransferManager:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._cancel_flags: dict[str, asyncio.Event] = {}
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
+        self._file_limiter = _DynamicLimiter(
+            lambda: min(16, max(4, self._config_getter().transfer_concurrency * 2))
+        )
+        self._stream_limiter = _DynamicLimiter(
+            lambda: min(32, max(4, self._config_getter().transfer_concurrency * 2))
+        )
 
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -275,22 +347,60 @@ class LocalTransferManager:
         cfg = self._config_getter()
         base_dir = await asyncio.to_thread(_prepare_download_base, cfg.local_download_dir)
 
-        file_jobs: list[tuple[str, Path, int]] = []
+        normalized_paths: list[str] = []
+        seen_req: set[str] = set()
         for raw_path in remote_paths:
-            stat = await self._bridge.request_json(
-                "GET", "/api/files/stat", params={"path": raw_path}
-            )
+            clean = sanitize_volume_path(raw_path)
+            if clean not in seen_req:
+                seen_req.add(clean)
+                normalized_paths.append(clean)
+
+        # When multiple sibling paths are selected together (e.g. "Select All -> Transfer to PC"),
+        # list each shared parent directory once instead of issuing N individual stat RPCs.
+        parent_counts: dict[str, int] = {}
+        for clean in normalized_paths:
+            if not clean:
+                continue
+            parent = str(PurePosixPath(clean).parent)
+            parent_clean = "" if parent == "." else parent
+            parent_counts[parent_clean] = parent_counts.get(parent_clean, 0) + 1
+
+        prefetched_entries: dict[str, dict[str, Any]] = {}
+        for parent_clean, count in parent_counts.items():
+            if count >= 2:
+                listing = await self._bridge.request_json(
+                    "GET",
+                    "/api/files",
+                    params={"path": parent_clean, "recursive": "false"},
+                )
+                for entry in listing:
+                    prefetched_entries[entry["path"]] = entry
+
+        file_jobs: list[tuple[str, Path, int]] = []
+        seen_files: set[str] = set()
+        for clean in normalized_paths:
+            stat = prefetched_entries.get(clean)
+            if stat is None:
+                stat = await self._bridge.request_json(
+                    "GET", "/api/files/stat", params={"path": clean}
+                )
             if not stat["is_dir"]:
-                rel = sanitize_local_relpath(stat["path"])
-                file_jobs.append((stat["path"], base_dir / rel, int(stat["size"])))
+                r_path = stat["path"]
+                if r_path not in seen_files:
+                    seen_files.add(r_path)
+                    rel = sanitize_local_relpath(r_path)
+                    file_jobs.append((r_path, base_dir / rel, int(stat["size"])))
             else:
                 children = await self._bridge.request_json(
                     "GET", "/api/files", params={"path": stat["path"], "recursive": "true"}
                 )
                 for child in children:
                     if not child["is_dir"]:
-                        rel = sanitize_local_relpath(child["path"])
-                        file_jobs.append((child["path"], base_dir / rel, int(child["size"])))
+                        r_path = child["path"]
+                        if r_path not in seen_files:
+                            seen_files.add(r_path)
+                            rel = sanitize_local_relpath(r_path)
+                            file_jobs.append((r_path, base_dir / rel, int(child["size"])))
 
         created: list[TransferItem] = []
         for r_path, l_path, size in file_jobs:
@@ -341,141 +451,195 @@ class LocalTransferManager:
         local_path: Path,
         cancel_evt: asyncio.Event,
     ) -> None:
-        cfg = self._config_getter()
-        concurrency = max(1, cfg.transfer_concurrency)
-        chunk_size = max(1, cfg.transfer_chunk_mb) * 1024 * 1024
         part_path = local_path.with_name(f"{local_path.name}.utdpart")
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-
-        item.status = "transferring"
-        item.updated_at = time.time()
-        await self._emit(item)
-
-        total = item.total_bytes
-        write_lock = threading.Lock()
-        bytes_lock = asyncio.Lock()
-        started = time.monotonic()
-        last_emit = started
-
         try:
-            if total == 0:
-                part_path.write_bytes(b"")
-                part_path.replace(local_path)
-                item.status = "completed"
-                item.progress = 100.0
+            async with self._file_limiter.acquire():
+                if cancel_evt.is_set():
+                    return
+
+                cfg = self._config_getter()
+                concurrency = max(1, cfg.transfer_concurrency)
+                chunk_size = max(1, cfg.transfer_chunk_mb) * 1024 * 1024
+
+                item.status = "transferring"
                 item.updated_at = time.time()
                 await self._emit(item)
-                return
 
-            with part_path.open("wb") as fh:
-                fh.truncate(total)
+                total = item.total_bytes
+                write_lock = threading.Lock()
+                bytes_lock = asyncio.Lock()
+                started = time.monotonic()
+                last_emit = started
 
-            # Build range chunks
-            ranges: list[tuple[int, int]] = []
-            offset = 0
-            while offset < total:
-                end = min(total - 1, offset + chunk_size - 1)
-                ranges.append((offset, end))
-                offset = end + 1
+                if total == 0:
 
-            range_q: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
-            for r in ranges:
-                range_q.put_nowait(r)
+                    def _write_empty() -> None:
+                        local_path.parent.mkdir(parents=True, exist_ok=True)
+                        part_path.write_bytes(b"")
+                        part_path.replace(local_path)
 
-            fh_handle = part_path.open("r+b")
-            try:
+                    await asyncio.to_thread(_write_empty)
+                    item.status = "completed"
+                    item.progress = 100.0
+                    item.updated_at = time.time()
+                    await self._emit(item)
+                    return
 
-                def _write_at(pos: int, data: bytes) -> None:
-                    with write_lock:
-                        fh_handle.seek(pos)
-                        fh_handle.write(data)
+                def _prepare_part_file() -> Any:
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    with part_path.open("wb") as fh:
+                        fh.truncate(total)
+                    return part_path.open("r+b")
 
-                async def _worker() -> None:
-                    nonlocal last_emit
-                    while not cancel_evt.is_set():
-                        try:
-                            start_b, end_b = range_q.get_nowait()
-                        except asyncio.QueueEmpty:
-                            return
+                # Build range chunks
+                ranges: list[tuple[int, int]] = []
+                offset = 0
+                while offset < total:
+                    end = min(total - 1, offset + chunk_size - 1)
+                    ranges.append((offset, end))
+                    offset = end + 1
 
-                        attempt = 0
-                        while True:
-                            attempt += 1
-                            chunk_written = 0
-                            expected_len = end_b - start_b + 1
+                range_q: asyncio.Queue[tuple[int, int]] = asyncio.Queue()
+                for r in ranges:
+                    range_q.put_nowait(r)
+
+                fh_handle = await asyncio.to_thread(_prepare_part_file)
+                try:
+
+                    def _write_at(pos: int, data: bytes) -> None:
+                        with write_lock:
+                            fh_handle.seek(pos)
+                            fh_handle.write(data)
+
+                    async def _worker() -> None:
+                        nonlocal last_emit
+                        while not cancel_evt.is_set():
                             try:
-                                status_code, _, body_iter = await self._bridge.stream_file_request(
-                                    "/api/files/download",
-                                    params={"path": item.remote_path},
-                                    extra_headers={"Range": f"bytes={start_b}-{end_b}"},
-                                )
-                                async with contextlib.aclosing(body_iter):
-                                    if status_code != 206 and (start_b > 0 or len(ranges) > 1):
-                                        raise RuntimeError(
-                                            f"Upstream returned HTTP {status_code} instead of 206 "
-                                            f"Partial Content for range {start_b}-{end_b}."
-                                        )
-                                    cursor = start_b
-                                    async for chunk in body_iter:
+                                start_b, end_b = range_q.get_nowait()
+                            except asyncio.QueueEmpty:
+                                return
+
+                            attempt = 0
+                            while True:
+                                attempt += 1
+                                chunk_written = 0
+                                expected_len = end_b - start_b + 1
+                                try:
+                                    async with self._stream_limiter.acquire():
                                         if cancel_evt.is_set():
                                             return
-                                        remaining = expected_len - chunk_written
-                                        if remaining <= 0:
-                                            break
-                                        piece = chunk[:remaining]
-                                        await asyncio.to_thread(_write_at, cursor, piece)
-                                        cursor += len(piece)
-                                        chunk_written += len(piece)
-                                        async with bytes_lock:
-                                            item.transferred_bytes += len(piece)
-                                            now = time.monotonic()
-                                            elapsed = max(0.05, now - started)
-                                            item.speed_bps = int(item.transferred_bytes / elapsed)
-                                            item.progress = round(
-                                                min(
-                                                    100.0, (item.transferred_bytes / total) * 100.0
-                                                ),
-                                                2,
-                                            )
-                                            if now - last_emit >= 0.25:
-                                                last_emit = now
-                                                item.updated_at = time.time()
-                                                await self._emit(item)
-                                if chunk_written != expected_len and not cancel_evt.is_set():
-                                    raise RuntimeError(
-                                        f"Truncated range {start_b}-{end_b}: "
-                                        f"got {chunk_written}/{expected_len} bytes."
-                                    )
-                                break
-                            except Exception:
-                                if chunk_written:
-                                    async with bytes_lock:
-                                        item.transferred_bytes = max(
-                                            0, item.transferred_bytes - chunk_written
+                                        (
+                                            status_code,
+                                            _,
+                                            body_iter,
+                                        ) = await self._bridge.stream_file_request(
+                                            "/api/files/download",
+                                            params={"path": item.remote_path},
+                                            extra_headers={"Range": f"bytes={start_b}-{end_b}"},
                                         )
-                                if attempt >= 3 or cancel_evt.is_set():
-                                    raise
-                                await asyncio.sleep(0.4 * attempt)
+                                        async with contextlib.aclosing(body_iter):
+                                            if status_code != 206 and (
+                                                start_b > 0 or len(ranges) > 1
+                                            ):
+                                                raise RuntimeError(
+                                                    f"Upstream returned HTTP {status_code} instead "
+                                                    f"of 206 Partial Content for range "
+                                                    f"{start_b}-{end_b}."
+                                                )
+                                            cursor = start_b
+                                            async for chunk in body_iter:
+                                                if cancel_evt.is_set():
+                                                    return
+                                                remaining = expected_len - chunk_written
+                                                if remaining <= 0:
+                                                    break
+                                                piece = chunk[:remaining]
+                                                await asyncio.to_thread(_write_at, cursor, piece)
+                                                cursor += len(piece)
+                                                chunk_written += len(piece)
+                                                async with bytes_lock:
+                                                    item.transferred_bytes += len(piece)
+                                                    now = time.monotonic()
+                                                    elapsed = max(0.05, now - started)
+                                                    item.speed_bps = int(
+                                                        item.transferred_bytes / elapsed
+                                                    )
+                                                    item.progress = round(
+                                                        min(
+                                                            100.0,
+                                                            (item.transferred_bytes / total)
+                                                            * 100.0,
+                                                        ),
+                                                        2,
+                                                    )
+                                                    if now - last_emit >= 0.25:
+                                                        last_emit = now
+                                                        item.updated_at = time.time()
+                                                        await self._emit(item)
+                                        if (
+                                            chunk_written != expected_len
+                                            and not cancel_evt.is_set()
+                                        ):
+                                            raise RuntimeError(
+                                                f"Truncated range {start_b}-{end_b}: "
+                                                f"got {chunk_written}/{expected_len} bytes."
+                                            )
+                                    break
+                                except Exception as exc:
+                                    if chunk_written:
+                                        async with bytes_lock:
+                                            item.transferred_bytes = max(
+                                                0, item.transferred_bytes - chunk_written
+                                            )
+                                    is_rate_limited = (
+                                        isinstance(exc, ModalBridgeError) and exc.status_code == 429
+                                    )
+                                    is_permanent = (
+                                        isinstance(exc, ModalBridgeError)
+                                        and exc.status_code in _NON_RETRYABLE_STATUS_CODES
+                                    )
+                                    max_attempts = 6 if is_rate_limited else 3
+                                    if (
+                                        is_permanent
+                                        or attempt >= max_attempts
+                                        or cancel_evt.is_set()
+                                    ):
+                                        raise
+                                    if is_rate_limited:
+                                        retry_after = (
+                                            exc.retry_after
+                                            if isinstance(exc, ModalBridgeError)
+                                            else None
+                                        )
+                                        delay = (
+                                            retry_after
+                                            if retry_after is not None
+                                            else min(8.0, 0.5 * (2 ** (attempt - 1)))
+                                            * random.uniform(0.85, 1.15)
+                                        )
+                                    else:
+                                        delay = 0.4 * attempt
+                                    await asyncio.sleep(delay)
 
-                workers = [
-                    asyncio.create_task(_worker()) for _ in range(min(concurrency, len(ranges)))
-                ]
-                await asyncio.gather(*workers)
-            finally:
-                fh_handle.close()
+                    workers = [
+                        asyncio.create_task(_worker()) for _ in range(min(concurrency, len(ranges)))
+                    ]
+                    await asyncio.gather(*workers)
+                finally:
+                    await asyncio.to_thread(fh_handle.close)
 
-            if cancel_evt.is_set():
-                part_path.unlink(missing_ok=True)
-                return
+                if cancel_evt.is_set():
+                    part_path.unlink(missing_ok=True)
+                    return
 
-            part_path.replace(local_path)
-            elapsed = max(0.01, time.monotonic() - started)
-            item.transferred_bytes = total
-            item.progress = 100.0
-            item.speed_bps = int(total / elapsed)
-            item.status = "completed"
-            item.updated_at = time.time()
-            await self._emit(item)
+                await asyncio.to_thread(part_path.replace, local_path)
+                elapsed = max(0.01, time.monotonic() - started)
+                item.transferred_bytes = total
+                item.progress = 100.0
+                item.speed_bps = int(total / elapsed)
+                item.status = "completed"
+                item.updated_at = time.time()
+                await self._emit(item)
 
         except asyncio.CancelledError:
             part_path.unlink(missing_ok=True)
