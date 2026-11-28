@@ -583,10 +583,16 @@ input:focus, select:focus, .textarea:focus {
 }
 
 .progress-fill {
+  /* Animated with a compositor-only transform: no layout, no paint, no per-frame style churn
+     even when hundreds of rows update at once. JS only writes the --progress custom property. */
+  --progress: 0;
+  width: 100%;
   height: 100%;
   border-radius: 999px;
   background: linear-gradient(90deg, var(--accent), var(--success));
-  transition: width 0.25s ease;
+  transform: scaleX(var(--progress));
+  transform-origin: left center;
+  transition: transform 0.18s linear;
 }
 
 .job-stats {
@@ -783,6 +789,10 @@ input:focus, select:focus, .textarea:focus {
 }
 
 /* Transfers */
+.transfers-card {
+  margin-top: 14px;
+}
+
 .transfers-list {
   display: flex;
   flex-direction: column;
@@ -794,6 +804,208 @@ input:focus, select:focus, .textarea:focus {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 12px;
+  /* Skip layout/paint for rows scrolled out of view: a 5,000-file ledger costs the same
+     as the handful of rows actually on screen. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 92px;
+}
+
+.transfer-row-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.transfer-row-name {
+  min-width: 0;
+}
+
+.transfer-row-name strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transfer-path {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Moving sheen on the *live* rows only. The backend bounds concurrent transfers (<= 16),
+   so this stays a handful of cheap compositor animations instead of one per file. */
+.transfer-row.is-live .progress-track {
+  position: relative;
+}
+
+.transfer-row.is-live .progress-track::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 42%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.42), transparent);
+  transform: translateX(-120%);
+  animation: track-sheen 1.5s linear infinite;
+  will-change: transform;
+  pointer-events: none;
+}
+
+.transfer-row.is-done {
+  border-color: rgba(45, 212, 191, 0.35);
+}
+
+.transfer-row.is-failed {
+  border-color: rgba(248, 113, 113, 0.45);
+}
+
+@keyframes track-sheen {
+  from { transform: translateX(-120%); }
+  to { transform: translateX(260%); }
+}
+
+/* ---------- Transfer pulse hero: one canvas for the whole ledger ---------- */
+
+.transfer-hero {
+  position: relative;
+  overflow: hidden;
+  margin-bottom: 14px;
+  border-color: var(--border);
+  transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+.transfer-hero.is-active {
+  border-color: rgba(79, 140, 255, 0.55);
+  box-shadow: 0 0 0 1px rgba(79, 140, 255, 0.16), 0 12px 34px rgba(20, 40, 80, 0.5);
+}
+
+.transfer-hero.is-finished {
+  border-color: rgba(45, 212, 191, 0.5);
+  box-shadow: 0 0 0 1px rgba(45, 212, 191, 0.16), 0 12px 30px rgba(10, 45, 45, 0.45);
+}
+
+.transfer-hero-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.hero-eyebrow {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.hero-title {
+  margin: 2px 0 0;
+  font-size: 16px;
+  background: linear-gradient(90deg, #93c5fd, #5eead4);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.hero-pct {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  color: #dbeafe;
+  transform-origin: right center;
+}
+
+.transfer-hero.is-active .hero-pct {
+  color: #bfdbfe;
+}
+
+.transfer-hero.is-finished .hero-pct {
+  color: #5eead4;
+}
+
+.transfer-hero.is-celebrating .hero-pct {
+  animation: hero-pop 0.65s ease-out 2;
+}
+
+@keyframes hero-pop {
+  0% { transform: scale(1); }
+  35% { transform: scale(1.14); }
+  100% { transform: scale(1); }
+}
+
+.transfer-motion {
+  display: block;
+  width: 100%;
+  height: 104px;
+  margin: 2px 0 8px;
+}
+
+.hero-track {
+  height: 10px;
+}
+
+.hero-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 22px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.hero-stats .hero-label {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.hero-status {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.transfer-hero.is-active .hero-status {
+  color: #bfdbfe;
+}
+
+.transfer-hero.is-finished .hero-status {
+  color: #5eead4;
+}
+
+@media (max-width: 640px) {
+  .transfer-motion {
+    height: 78px;
+  }
+  .hero-pct {
+    font-size: 20px;
+  }
+  .hero-stats {
+    gap: 8px 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-fill {
+    transition: none;
+  }
+  .transfer-row.is-live .progress-track::after,
+  .transfer-hero.is-celebrating .hero-pct {
+    animation: none;
+  }
+  .conn-reconnecting .dot {
+    animation: none;
+  }
 }
 
 /* Settings */

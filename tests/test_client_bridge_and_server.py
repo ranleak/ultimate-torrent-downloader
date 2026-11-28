@@ -241,15 +241,62 @@ function makeClassList(initial = []) {
       if (force) set.add(n); else set.delete(n);
       return Boolean(force);
     },
+    __set: set,
   };
 }
 
-function makeElement(id = "") {
+// Minimal but faithful DOM node: child nodes are real objects, innerHTML reflects the live
+// child tree, and querySelector() understands the simple class/attribute selectors app.js
+// uses to patch individual rows in place.
+const VOID_TAGS = new Set(["br", "img", "input", "hr", "meta", "link"]);
+
+function selectorMatches(node, selector) {
+  if (selector.startsWith(".") && !selector.includes(" ")) {
+    return Boolean(node.classList && node.classList.contains(selector.slice(1)));
+  }
+  if (selector.startsWith("[") && selector.endsWith("]")) {
+    const body = selector.slice(1, -1);
+    const eq = body.indexOf("=");
+    const name = eq === -1 ? body : body.slice(0, eq);
+    const value = eq === -1 ? null : body.slice(eq + 1).replace(/^["']|["']$/g, "");
+    if (!node.attrs || !(name in node.attrs)) return false;
+    return value === null || String(node.attrs[name]) === value;
+  }
+  return node.tagName === selector.toLowerCase();
+}
+
+function attrsToString(node) {
+  const parts = [];
+  const attrs = Object.assign({}, node.attrs || {});
+  const classes = node.classList ? Array.from(node.classList.__set || []) : [];
+  if (classes.length && !attrs.class) attrs.class = classes.join(" ");
+  for (const [key, value] of Object.entries(node.dataset || {})) {
+    const attrName = `data-${String(key).replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`;
+    if (!(attrName in attrs)) attrs[attrName] = value;
+  }
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v === "" && (k === "class" || k === "id")) continue;
+    parts.push(` ${k}="${v}"`);
+  }
+  return parts.join("");
+}
+
+function serializeNode(node) {
+  if (!node) return "";
+  if (node.__text__) return node.textContent;
+  const ownText = node.children.length === 0 ? node.textContent || "" : "";
+  const inner = ownText + node.children.map(serializeNode).join("");
+  if (VOID_TAGS.has(node.tagName)) return `<${node.tagName}${attrsToString(node)}>`;
+  return `<${node.tagName}${attrsToString(node)}>${inner}</${node.tagName}>`;
+}
+
+function makeElement(tag = "div", id = "") {
   const listeners = new Map();
   let text = "";
-  let html = "";
-  const children = [];
-  return {
+  const attrs = {};
+  const classList = makeClassList();
+  const el = {
+    tagName: tag,
     id,
     value: id === "log-level-filter" ? "ALL" : "",
     checked: id === "opt-extra-trackers" || id === "log-autoscroll",
@@ -260,26 +307,72 @@ function makeElement(id = "") {
     files: [],
     scrollTop: 0,
     scrollHeight: 0,
-    className: "",
-    classList: makeClassList(),
-    children,
-    get textContent() { return text; },
+    attrs,
+    classList,
+    children: [],
+    parentNode: null,
+    get className() {
+      return Array.from(classList.__set || []).join(" ");
+    },
+    set className(v) {
+      classList.__set.clear();
+      String(v || "")
+        .split(/\s+/)
+        .filter(Boolean)
+        .forEach((c) => classList.__set.add(c));
+      attrs.class = Array.from(classList.__set).join(" ");
+    },
+    get textContent() {
+      if (el.children.length) return el.children.map((c) => c.textContent).join("");
+      return text;
+    },
     set textContent(v) {
       text = String(v ?? "");
-      html = text
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
+      el.children.length = 0;
     },
-    get innerHTML() { return html; },
+    get innerHTML() {
+      return el.children.length ? el.children.map(serializeNode).join("") : text;
+    },
     set innerHTML(v) {
-      html = String(v ?? "");
-      text = html;
+      el.children.length = 0;
+      text = "";
+      parseHtml(el, String(v ?? ""));
     },
-    appendChild(child) { children.push(child); return child; },
+    appendChild(child) {
+      if (child && child.__fragment__) {
+        for (const node of [...child.children]) el.appendChild(node);
+        return child;
+      }
+      if (child && child.parentNode) child.parentNode.removeChild(child);
+      el.children.push(child);
+      if (child) child.parentNode = el;
+      return child;
+    },
+    removeChild(child) {
+      const idx = el.children.indexOf(child);
+      if (idx >= 0) {
+        el.children.splice(idx, 1);
+        child.parentNode = null;
+      }
+      return child;
+    },
     remove() {
-      const idx = children.indexOf(this);
-      if (idx >= 0) children.splice(idx, 1);
+      if (el.parentNode) el.parentNode.removeChild(el);
+    },
+    querySelector(selector) {
+      const found = el.querySelectorAll(selector);
+      return found.length ? found[0] : null;
+    },
+    querySelectorAll(selector) {
+      const found = [];
+      const walk = (node) => {
+        for (const child of node.children) {
+          if (selectorMatches(child, selector)) found.push(child);
+          walk(child);
+        }
+      };
+      walk(el);
+      return found;
     },
     addEventListener(type, fn) {
       if (!listeners.has(type)) listeners.set(type, []);
@@ -299,12 +392,89 @@ function makeElement(id = "") {
     showModal() {},
     close() {},
   };
+  return el;
+}
+
+function parseHtml(root, html) {
+  const stack = [root];
+  const tagRe = /<(\/?)([a-zA-Z][\w-]*)((?:"[^"]*"|'[^']*'|[^>"'])*?)(\/?)>|([^<]+)/g;
+  let match;
+  while ((match = tagRe.exec(html)) !== null) {
+    const [, closing, tagName, attrRaw, selfClose, textNode] = match;
+    const parent = stack[stack.length - 1];
+    if (textNode !== undefined) {
+      const trimmed = textNode.replace(/\s+/g, " ");
+      if (trimmed.trim()) {
+        const textEl = makeElement("#text");
+        textEl.__text__ = true;
+        textEl.textContent = trimmed;
+        parent.appendChild(textEl);
+      }
+      continue;
+    }
+    if (closing) {
+      if (stack.length > 1) stack.pop();
+      continue;
+    }
+    const node = makeElement(String(tagName).toLowerCase());
+    const attrRe = /([\w:-]+)(?:=(?:"([^"]*)"|'([^']*)'))?/g;
+    for (const attrMatch of String(attrRaw || "").matchAll(attrRe)) {
+      const name = attrMatch[1];
+      const value = attrMatch[2] ?? attrMatch[3] ?? "";
+      node.attrs[name] = value;
+      if (name === "class") {
+        node.className = value;
+        value.split(/\s+/).filter(Boolean).forEach((c) => node.classList.add(c));
+      } else if (name === "id") {
+        node.id = value;
+      } else if (name.startsWith("data-")) {
+        const key = name.slice(5).replace(/-(\w)/g, (_m, ch) => ch.toUpperCase());
+        node.dataset[key] = value;
+      } else if (name === "disabled") {
+        node.disabled = true;
+      }
+    }
+    parent.appendChild(node);
+    if (!selfClose && !VOID_TAGS.has(node.tagName)) stack.push(node);
+  }
 }
 
 const elements = new Map();
 function getEl(sel) {
   const id = sel.startsWith("#") ? sel.slice(1) : sel;
-  if (!elements.has(id)) elements.set(id, makeElement(id));
+  if (!elements.has(id)) {
+    const containerRe = /(?:jobs|transfers)-list|log-console|exp-tbody|preview-dialog-body|/;
+    const isContainer = containerRe.test(id) || id === "toast-container";
+    const tag = isContainer ? "div" : "button";
+    const el = makeElement(tag, id);
+    // Mirror the real markup for containers the GUI mounts generated content into.
+    if (/-list$|^log-console$/.test(id)) el.innerHTML = "";
+    if (id === "transfers-motion") {
+      // Canvas stub so the single aggregated animation is exercised without a GPU.
+      el.tagName = "canvas";
+      el.width = 0;
+      el.height = 0;
+      el.clientWidth = 640;
+      el.clientHeight = 104;
+      el.getBoundingClientRect = () => ({ width: 640, height: 104 });
+      el.getContext = () => ({
+        setTransform() {},
+        clearRect() {},
+        beginPath() {},
+        moveTo() {},
+        lineTo() {},
+        closePath() {},
+        fill() {},
+        stroke() {},
+        arc() {},
+        createLinearGradient: () => ({ addColorStop() {} }),
+        fillStyle: "",
+        strokeStyle: "",
+        lineWidth: 1,
+      });
+    }
+    elements.set(id, el);
+  }
   return elements.get(id);
 }
 
@@ -374,13 +544,28 @@ const context = vm.createContext({
   fetch: clientFetch,
   WebSocket: FakeWebSocket,
   EventSource: FakeEventSource,
+  Promise,
+  // Frames are drained as microtasks so assertions observe a painted UI after each `await`,
+  // while the app still gets real rAF-style coalescing (no synchronous re-render storms).
+  performance: { now: () => Date.now() },
+  requestAnimationFrame: (cb) => {
+    Promise.resolve().then(() => cb(Date.now()));
+    return 1;
+  },
   location: { protocol: "http:", host, href: `${baseUrl}/` },
   navigator: { clipboard: { writeText: async () => {} } },
   window: { prompt: () => null, confirm: () => false },
   document: {
+    hidden: false,
+    visibilityState: "visible",
     querySelector: (sel) => getEl(sel),
     querySelectorAll: () => [],
-    createElement: () => makeElement(),
+    createElement: (tag) => makeElement(tag ? String(tag).toLowerCase() : "div"),
+    createDocumentFragment: () => {
+      const frag = makeElement("#fragment");
+      frag.__fragment__ = true;
+      return frag;
+    },
   },
 });
 
@@ -495,6 +680,101 @@ assert.ok(
     t.textContent.includes("Simulated upstream failure")
   )
 );
+
+// 7. A burst of transfer telemetry collapses into a bounded number of animated surfaces.
+//    The ledger gets one row element per file and only the single hero canvas carries motion.
+const manyFiles = Array.from({ length: 240 }, (_v, idx) => ({
+  transfer_id: `tr-${idx}`,
+  remote_path: `downloads/big-pack/file_${idx}.bin`,
+  local_path: `C:/dl/big-pack/file_${idx}.bin`,
+  filename: `file_${idx}.bin`,
+  total_bytes: 4096,
+  transferred_bytes: 0,
+  speed_bps: 0,
+  progress: 0,
+  status: "queued",
+  created_at: 1000 + idx,
+}));
+
+vm.runInContext("switchTab('transfers'); flushNow();", context);
+assert.equal(vm.runInContext("state.activeTab", context), "transfers");
+
+const transfersList = getEl("#transfers-list");
+let listWrites = 0;
+const originalAppend = transfersList.appendChild.bind(transfersList);
+transfersList.appendChild = (child) => {
+  // Count structural rebuilds only (a fragment re-attach), not the real appendChild's
+  // internal per-node recursion.
+  if (child && child.__fragment__) listWrites += 1;
+  return originalAppend(child);
+};
+
+const transferEvents = [];
+for (let round = 0; round < 12; round += 1) {
+  for (const item of manyFiles) {
+    transferEvents.push({
+      type: "transfer",
+      data: {
+        ...item,
+        status: "transferring",
+        transferred_bytes: 512 * (round + 1),
+        progress: Math.min(100, ((round + 1) / 12) * 100),
+        speed_bps: 262144,
+      },
+    });
+  }
+}
+
+// 2,880 progress events delivered back-to-back without yielding a frame: nothing may paint.
+for (const event of transferEvents) ws.onmessage({ data: JSON.stringify(event) });
+assert.equal(listWrites, 0, "transfer telemetry must not paint synchronously");
+
+// One frame later the whole burst is on screen, with at most one ledger rebuild.
+vm.runInContext("flushNow()", context);
+assert.ok(listWrites <= 1, `expected a single coalesced ledger paint, saw ${listWrites}`);
+assert.equal(transfersList.children.length, 240);
+assert.match(transfersList.innerHTML, /file_0\.bin/);
+assert.match(transfersList.innerHTML, /file_239\.bin/);
+
+// The fun lives in exactly one canvas, driven by one shared frame loop.
+assert.equal(vm.runInContext("motion.canvas === null ? 'none' : 'canvas'", context), "canvas");
+assert.equal(vm.runInContext("paintMotion(16, 16)", context), true);
+const energy = vm.runInContext("motion.energy", context);
+assert.ok(energy > 0, "live transfers should energise the pulse");
+const stillDirty = vm.runInContext("JSON.stringify(dirty)", context).includes("true");
+assert.equal(stillDirty, false, "no pending repaint after a flush");
+
+// Progress ticks patch rows in place: no ledger rebuild, no DOM churn explosion.
+const writesAfterFirstPaint = listWrites;
+for (const item of manyFiles) {
+  ws.onmessage({
+    data: JSON.stringify({
+      type: "transfer",
+      data: { ...item, status: "completed", transferred_bytes: 4096, progress: 100 },
+    }),
+  });
+}
+assert.equal(listWrites, writesAfterFirstPaint, "row updates must not rebuild the ledger");
+vm.runInContext("flushNow()", context);
+assert.equal(vm.runInContext("transfersView.cards.size", context), 240);
+assert.equal(vm.runInContext("transfersView.summary.done", context), 240);
+vm.runInContext("flushNow()", context);
+
+// Hidden panels never paint, and an idle GUI stops scheduling animation frames entirely.
+vm.runInContext("switchTab('torrents'); flushNow();", context);
+const writesWhileHidden = listWrites;
+for (const item of manyFiles) {
+  ws.onmessage({
+    data: JSON.stringify({
+      type: "transfer",
+      data: { ...item, status: "completed", progress: 100 },
+    }),
+  });
+}
+vm.runInContext("flushNow()", context);
+assert.equal(listWrites, writesWhileHidden, "hidden transfer ledger must not repaint");
+const idleAnimating = vm.runInContext("paintMotion(32, 16)", context);
+assert.equal(idleAnimating, false, "idle transfers stop the animation loop");
 """,
         encoding="utf-8",
     )

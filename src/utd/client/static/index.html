@@ -270,7 +270,37 @@
 
       <!-- ==================== PC TRANSFERS TAB ==================== -->
       <section id="tab-transfers" class="tab-panel">
-        <div class="card">
+        <!--
+          One aggregated "pulse" for the whole transfer ledger. The animation is a single
+          canvas driven by the shared frame loop, so a 5,000-file folder transfer still costs
+          exactly one animated surface instead of thousands of independent progress bars.
+        -->
+        <div id="transfer-hero" class="card transfer-hero is-idle">
+          <div class="transfer-hero-head">
+            <div class="hero-heading">
+              <span class="hero-eyebrow">Local PC accelerator</span>
+              <h2 class="hero-title">Transfer pulse</h2>
+            </div>
+            <div class="hero-pct mono" id="transfers-pct-wrap">
+              <span id="transfers-pct">0.0%</span>
+            </div>
+          </div>
+          <canvas id="transfers-motion" class="transfer-motion" height="104" aria-hidden="true"></canvas>
+          <div class="progress-track hero-track">
+            <div id="transfers-progress" class="progress-fill"></div>
+          </div>
+          <div class="hero-stats mono">
+            <span><span class="hero-label">Rate</span><strong id="transfers-speed">idle</strong></span>
+            <span><span class="hero-label">Payload</span><strong id="transfers-bytes">0 B / 0 B</strong></span>
+            <span><span class="hero-label">ETA</span><strong id="transfers-eta">—</strong></span>
+            <span><span class="hero-label">Files</span><strong id="transfers-count">0</strong></span>
+          </div>
+          <div id="transfers-status-line" class="hero-status">
+            Nothing queued — pick files in Volume Explorer and choose Save to PC.
+          </div>
+        </div>
+
+        <div class="card transfers-card">
           <div class="panel-header">
             <div>
               <h2>Local Device Transfers</h2>
@@ -279,7 +309,7 @@
             <button id="open-local-folder-btn" class="btn btn-primary btn-sm" type="button">Open Downloads Folder</button>
           </div>
           <div id="transfers-list" class="transfers-list">
-            <div class="empty-state">No transfers yet. Use "Transfer to PC" in Volume Explorer for accelerated multi-stream downloads.</div>
+            <div class="empty-state">No transfers yet. Use "Save to PC" in Volume Explorer for accelerated multi-stream downloads.</div>
           </div>
         </div>
       </section>
