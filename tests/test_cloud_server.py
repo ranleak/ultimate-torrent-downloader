@@ -251,3 +251,72 @@ async def test_cloud_websocket_and_sse_streaming(tmp_path: Path) -> None:
         server.should_exit = True
         await srv_task
         await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_cloud_cancel_job_broadcasts_cancelled_status(tmp_path: Path) -> None:
+    started = asyncio.Event()
+
+    async def _slow_worker(
+        job: JobInfo,
+        _output_dir: Path,
+        _source_uri: str | None,
+        _torrent_bytes: bytes | None,
+        _trackers: list[str] | None,
+        _is_private: bool,
+        on_progress,
+        _on_log,
+    ) -> None:
+        job.status = JobStatus.DOWNLOADING
+        job.total_bytes = 1000
+        job.completed_bytes = 250
+        job.download_speed = 500
+        job.eta_seconds = 2
+        await on_progress(job)
+        started.set()
+        await asyncio.sleep(60.0)
+
+    backend = LocalTorrentBackend(tmp_path, worker_runner=_slow_worker)
+    app = create_cloud_app(backend, api_token="cancel-tok")
+
+    port = find_free_tcp_port()
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    srv_task = asyncio.create_task(server.serve())
+    await asyncio.sleep(0.15)
+
+    try:
+        headers = {"Authorization": "Bearer cancel-tok"}
+        async with (
+            httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client,
+            websockets.connect(f"ws://127.0.0.1:{port}/ws/jobs?token=cancel-tok") as ws,
+        ):
+            magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=CancelMe"
+            sub = await client.post("/api/jobs/magnet", headers=headers, json={"uri": magnet})
+            assert sub.status_code == 200
+            job_id = sub.json()["job_id"]
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+
+            cancel_resp = await client.post(f"/api/jobs/{job_id}/cancel", headers=headers)
+            assert cancel_resp.status_code == 200
+            body = cancel_resp.json()
+            assert body["status"] == "cancelled"
+            assert body["download_speed"] == 0
+            assert body["upload_speed"] == 0
+            assert body["eta_seconds"] is None
+
+            seen_cancelled_ws = False
+            for _ in range(20):
+                raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                evt = json.loads(raw)
+                if (
+                    evt.get("job_id") == job_id
+                    and evt.get("type") == "status"
+                    and evt.get("data", {}).get("status") == "cancelled"
+                ):
+                    seen_cancelled_ws = True
+                    break
+            assert seen_cancelled_ws is True
+    finally:
+        server.should_exit = True
+        await srv_task
+        await backend.close()

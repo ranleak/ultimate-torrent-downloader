@@ -144,6 +144,8 @@ class LocalTorrentBackend:
         _, out_dir = self._job_output_dir(job.options)
 
         async def on_progress(updated: JobInfo) -> None:
+            if updated.job_id not in self._jobs:
+                return
             self._jobs[updated.job_id] = updated.model_copy(deep=True)
             await self._broadcast(
                 StreamEvent(
@@ -275,6 +277,21 @@ class LocalTorrentBackend:
         supervisor = self._supervisors.get(job_id)
         if supervisor is not None:
             await supervisor.enqueue_command(command)
+            if command.action == "cancel":
+                job.status = JobStatus.CANCELLED
+                job.download_speed = 0
+                job.upload_speed = 0
+                job.eta_seconds = None
+                job.updated_at = time.time()
+                job.finished_at = job.updated_at
+                await self._broadcast(
+                    StreamEvent(
+                        type="status",
+                        job_id=job.job_id,
+                        ts=job.updated_at,
+                        data=job.model_dump(exclude={"logs"}),
+                    )
+                )
             return self._jobs[job_id]
 
         # Handle commands when running with a custom test runner or stopped job
@@ -313,6 +330,7 @@ class LocalTorrentBackend:
             job.status = JobStatus.CANCELLED
             job.download_speed = 0
             job.upload_speed = 0
+            job.eta_seconds = None
             job.finished_at = time.time()
             if command.delete_files:
                 self._delete_job_files_sync(job)
